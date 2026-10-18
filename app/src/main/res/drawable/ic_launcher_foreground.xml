@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <!-- CRT tube: rounded screen with an RGB phosphor triad -->
+    <path
+        android:fillColor="#1B1B1F"
+        android:pathData="M18,30 C18,22 24,18 32,18 L76,18 C84,18 90,22 90,30 L90,66 C90,76 82,82 72,83 L36,83 C26,82 18,76 18,66 Z"/>
+    <path
+        android:fillColor="#0A0F0B"
+        android:pathData="M24,34 C24,29 27,26 32,26 L76,26 C81,26 84,29 84,34 L84,62 C84,68 79,72 72,73 L36,73 C29,72 24,68 24,62 Z"/>
+    <!-- phosphor triads -->
+    <path android:fillColor="#FF3B30" android:pathData="M34,36 L40,36 L40,64 L34,64 Z"/>
+    <path android:fillColor="#34C759" android:pathData="M44,36 L50,36 L50,64 L44,64 Z"/>
+    <path android:fillColor="#0A84FF" android:pathData="M54,36 L60,36 L60,64 L54,64 Z"/>
+    <path android:fillColor="#FF3B30" android:pathData="M64,36 L70,36 L70,64 L64,64 Z" android:alpha="0.55"/>
+    <!-- scanline sheen -->
+    <path android:fillColor="#FFFFFF" android:alpha="0.08"
+        android:pathData="M24,34 L84,34 L84,44 L24,44 Z"/>
+    <!-- brand plate -->
+    <path android:fillColor="#B9BDC7"
+        android:pathData="M40,90 L68,90 L68,94 L40,94 Z"/>
+</vector>
