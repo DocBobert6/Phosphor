@@ -1260,6 +1260,12 @@ void Renderer::onFrameYUV(const uint8_t* y, int yRowStride, int yPixStride,
     if (width == 0 || height == 0 || width > 3840 || height > 2160) return;
     uint32_t cw = (width + 1) / 2;
     uint32_t ch = (height + 1) / 2;
+    // Hold frameMutex for the whole copy. The render thread only claims a
+    // different (PENDING) slot, so this costs a few ms of serialisation,
+    // but it closes a real use-after-free: shutdown frees the slot buffers
+    // under frameMutex, and a writer copying outside the lock could be
+    // writing into a freed slot during a surface recreation (the 1.1.0-test1
+    // native crash happened across exactly such a recreation).
     int slot = -1;
     {
         std::lock_guard<std::mutex> lock(frameMutex_);
@@ -1271,26 +1277,21 @@ void Renderer::onFrameYUV(const uint8_t* y, int yRowStride, int yPixStride,
                 break;
             }
         }
-    }
-    if (slot < 0) return;  // both slots busy: drop this frame, never tear one
-    uint8_t* dst = planeSlots_[slot].data;
-    copyPlane(y, yRowStride, yPixStride, dst, width, height);
-    copyPlane(u, uRowStride, uPixStride, dst + (size_t)width * height, cw, ch);
-    copyPlane(v, vRowStride, vPixStride,
-              dst + (size_t)width * height + (size_t)cw * ch, cw, ch);
-    {
-        std::lock_guard<std::mutex> lock(frameMutex_);
+        if (slot < 0) return;  // both slots busy: drop this frame, never tear one
+        uint8_t* dst = planeSlots_[slot].data;
+        copyPlane(y, yRowStride, yPixStride, dst, width, height);
+        copyPlane(u, uRowStride, uPixStride, dst + (size_t)width * height, cw, ch);
+        copyPlane(v, vRowStride, vPixStride,
+                  dst + (size_t)width * height + (size_t)cw * ch, cw, ch);
         planeSlots_[slot].w = width;
         planeSlots_[slot].h = height;
         planeSlots_[slot].cw = cw;
         planeSlots_[slot].ch = ch;
         planeSlots_[slot].state = 2;
+        videoAspect_ = (float)width / (float)height;
     }
     framePending_ = true;
     frameCv_.notify_all();
-    std::lock_guard<std::mutex> lock(frameMutex_);
-    if (!running_) return;
-    videoAspect_ = (float)width / (float)height;
 }
 
 void Renderer::destroyVideoResources() {

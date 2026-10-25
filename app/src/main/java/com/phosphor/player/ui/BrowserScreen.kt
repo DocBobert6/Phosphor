@@ -2,6 +2,7 @@ package com.phosphor.player.ui
 
 import android.content.Context
 import android.content.Intent
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -16,6 +17,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -36,6 +38,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.documentfile.provider.DocumentFile
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 private val VIDEO_EXTS = setOf("mp4", "mkv", "avi", "mov", "webm", "flv", "ts", "m2ts", "mpg", "mpeg")
 private const val PREFS = "phosphor"
@@ -46,10 +50,19 @@ private fun isVideo(name: String): Boolean {
     return ext in VIDEO_EXTS
 }
 
+private fun fmtDuration(ms: Long?): String {
+    if (ms == null || ms <= 0) return "…"
+    val s = ms / 1000
+    return if (s >= 3600) String.format("%d:%02d:%02d", s / 3600, (s % 3600) / 60, s % 60)
+    else String.format("%d:%02d", s / 60, s % 60)
+}
+
 /**
- * INPUT source browser: pick a single file, or grant a folder and browse it
- * like flipping through tapes on a shelf. No storage permission needed —
- * everything goes through the Storage Access Framework.
+ * INPUT source browser as a retro input shelf: a VHS tape rack, or a
+ * TV channel guide, instead of a generic Android file list. Each tape
+ * is a channel (CH 02, CH 03, …), its paper label shows the filename,
+ * duration, and file size in monospace type. No storage permission
+ * needed -- everything goes through the Storage Access Framework.
  */
 @Composable
 fun BrowserScreen(
@@ -61,6 +74,8 @@ fun BrowserScreen(
     var files by remember { mutableStateOf<List<DocumentFile>>(emptyList()) }
     var folderName by remember { mutableStateOf<String?>(null) }
     var scanning by remember { mutableStateOf(false) }
+    var guideMode by remember { mutableStateOf(false) }
+    var durations by remember { mutableStateOf<Map<String, Long>>(emptyMap()) }
 
     fun loadTree(treeUri: Uri) {
         scanning = true
@@ -75,6 +90,26 @@ fun BrowserScreen(
         } finally {
             scanning = false
         }
+    }
+
+    // Durations come from the files themselves, in the background, so
+    // the shelf stays responsive while each tape's label fills in.
+    LaunchedEffect(files) {
+        if (files.isEmpty()) return@LaunchedEffect
+        val found = withContext(Dispatchers.IO) {
+            files.associate { doc ->
+                doc.uri.toString() to try {
+                    MediaMetadataRetriever().use { r ->
+                        r.setDataSource(context, doc.uri)
+                        r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                            ?.toLongOrNull() ?: 0L
+                    }
+                } catch (_: Throwable) {
+                    0L
+                }
+            }
+        }
+        durations = found
     }
 
     val treePicker = rememberLauncherForActivityResult(
@@ -128,6 +163,20 @@ fun BrowserScreen(
                 modifier = Modifier.weight(1f),
             )
         }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            PanelButton(
+                "📼 TAPE RACK",
+                onClick = { guideMode = false },
+                accent = !guideMode,
+                modifier = Modifier.weight(1f),
+            )
+            PanelButton(
+                "📺 CHANNEL GUIDE",
+                onClick = { guideMode = true },
+                accent = guideMode,
+                modifier = Modifier.weight(1f),
+            )
+        }
 
         if (folderName != null) {
             SectionLabel("FOLDER: ${folderName!!.uppercase().take(28)}")
@@ -153,41 +202,76 @@ fun BrowserScreen(
                     color = Crt.TextDim, fontFamily = Crt.Mono, fontSize = 12.sp,
                 )
             }
-        } else {
-            LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        } else if (guideMode) {
+            // TV guide / channel grid.
+            LazyColumn(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 itemsIndexed(files, key = { _, doc -> doc.uri.toString() }) { index, doc ->
                     val name = doc.name ?: "Unknown"
+                    val ch = "%02d".format(index + 2)
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(Crt.ButtonFace)
+                            .border(1.dp, Crt.BezelEdge, RoundedCornerShape(8.dp))
+                            .clickable { onPlay(doc.uri, name) }
+                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        OsdText("CH $ch", size = 13)
+                        Spacer(Modifier.padding(4.dp))
+                        Text(
+                            name,
+                            color = Crt.TextMain,
+                            fontFamily = Crt.Mono,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 13.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f),
+                        )
+                        Spacer(Modifier.padding(4.dp))
+                        OsdText(fmtDuration(durations[doc.uri.toString()]), size = 11)
+                    }
+                }
+            }
+        } else {
+            LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                itemsIndexed(files, key = { _, doc -> doc.uri.toString() }) { index, doc ->
+                    val name = doc.name ?: "Unknown"
+                    val ch = "%02d".format(index + 2)
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
                             .clip(RoundedCornerShape(10.dp))
-                            .background(Crt.ButtonFace)
+                            .background(Color(0xFF1C1C22))
                             .border(1.dp, Crt.BezelEdge, RoundedCornerShape(10.dp))
                             .clickable { onPlay(doc.uri, name) }
-                            .padding(12.dp),
+                            .padding(10.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        // VHS spine: channel number on a tape label.
+                        // VHS spine: channel number, vertical.
                         Column(
                             modifier = Modifier
                                 .background(Crt.SilverDark, RoundedCornerShape(4.dp))
-                                .padding(horizontal = 8.dp, vertical = 10.dp),
+                                .padding(horizontal = 8.dp, vertical = 14.dp),
                             horizontalAlignment = Alignment.CenterHorizontally,
                         ) {
                             OsdText("CH", size = 9, color = Color.Black)
-                            OsdText(
-                                "%02d".format(index + 2),
-                                size = 13,
-                                color = Color.Black,
-                            )
+                            OsdText(ch, size = 13, color = Color.Black)
                         }
                         Spacer(Modifier.padding(4.dp))
-                        OsdText("📼", size = 14)
-                        Spacer(Modifier.padding(4.dp))
-                        Column(Modifier.weight(1f)) {
+                        // Paper label on the tape.
+                        Column(
+                            modifier = Modifier
+                                .weight(1f)
+                                .background(Color(0xFFF2EFE4), RoundedCornerShape(4.dp))
+                                .border(1.dp, Color(0xFFB8B0A0), RoundedCornerShape(4.dp))
+                                .padding(horizontal = 10.dp, vertical = 8.dp),
+                        ) {
                             Text(
                                 name,
-                                color = Crt.TextMain,
+                                color = Color(0xFF1A1C20),
                                 fontFamily = Crt.Mono,
                                 fontWeight = FontWeight.Bold,
                                 fontSize = 13.sp,
@@ -195,14 +279,39 @@ fun BrowserScreen(
                                 overflow = TextOverflow.Ellipsis,
                             )
                             Text(
-                                name.substringAfterLast('.', "").uppercase() +
+                                "CH $ch: $name",
+                                color = Color(0xFF3A3D44),
+                                fontFamily = Crt.Mono,
+                                fontSize = 10.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                fmtDuration(durations[doc.uri.toString()]) +
+                                        "  •  " +
+                                        name.substringAfterLast('.', "").uppercase() +
                                         (doc.length().takeIf { it > 0 }?.let {
                                             "  •  ${it / 1024 / 1024} MB"
                                         } ?: ""),
-                                color = Crt.TextDim,
+                                color = Color(0xFF3A3D44),
                                 fontFamily = Crt.Mono,
                                 fontSize = 11.sp,
                             )
+                        }
+                        Spacer(Modifier.padding(4.dp))
+                        // Tape reels, for the shelf look.
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            repeat(2) {
+                                androidx.compose.foundation.layout.Box(
+                                    modifier = Modifier
+                                        .size(14.dp)
+                                        .background(Color(0xFF3A3D44), RoundedCornerShape(7.dp))
+                                        .border(1.dp, Color(0xFF6B7280), RoundedCornerShape(7.dp)),
+                                )
+                            }
                         }
                     }
                 }

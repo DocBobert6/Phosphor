@@ -144,7 +144,7 @@ object CrashReporter {
         val pw = PrintWriter(sw)
         pw.println("PHOSPHOR CRASH REPORT")
         pw.println("time: " + SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date()))
-        pw.println("app: com.phosphor.player 1.0.0 (debug)")
+        pw.println("app: com.phosphor.player " + BuildConfig.VERSION_NAME + " (debug)")
         pw.println("device: ${Build.MANUFACTURER} ${Build.MODEL}")
         pw.println("android: ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})")
         pw.println("abis: ${Build.SUPPORTED_ABIS.joinToString(",")}")

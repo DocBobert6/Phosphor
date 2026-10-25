@@ -19,7 +19,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import com.phosphor.player.player.VideoEngine
 import com.phosphor.player.ui.BrowserScreen
-import com.phosphor.player.ui.PictureMenu
 import com.phosphor.player.ui.PictureSettings
 import com.phosphor.player.ui.PlayerScreen
 import com.phosphor.player.vulkan.VulkanBridge
@@ -86,14 +85,10 @@ class MainActivity : ComponentActivity() {
                             onSettingsChange = { pushPicture(it) },
                             onOpenPictureMenu = { showPictureMenu = true },
                             onOpenBrowser = { showBrowser = true },
-                        )
-                    }
-
-                    if (showPictureMenu) {
-                        PictureMenu(
-                            settings = picture,
-                            onSettingsChange = { pushPicture(it) },
-                            onDismiss = { showPictureMenu = false },
+                            // The OSD menu lives inside the tube now, not
+                            // as a separate overlay over the whole screen.
+                            showPictureMenu = showPictureMenu,
+                            onDismissPictureMenu = { showPictureMenu = false },
                         )
                     }
                 }
