@@ -1,7 +1,7 @@
 #version 450
 // Shared push-constant block for every Phosphor CRT preset.
 // The native renderer fills this from CrtParams (see phosphor.cpp);
-// field order and sizes must match exactly (60 bytes total).
+// field order and sizes must match exactly (76 bytes total).
 layout(push_constant) uniform Push {
     vec2  resolution;    // render-target size in px
     float time;          // seconds, for animated effects
@@ -18,13 +18,42 @@ layout(push_constant) uniform Push {
     float rotation;      // 0/1/2/3 = 0/90/180/270 degrees clockwise
     float zoom;          // 1 = normal, >1 zooms in, <1 zooms out
     float colorTemp;     // 0 = Cool (~9300K, factory), 1 = Medium, 2 = Warm (~6500K)
+    float flip;          // 0 = normal, 1 = mirror horizontally
+    float colorMatrix;   // 0 = BT.601 (SD), 1 = BT.709 (HD)
+    float scanlineTvl;   // virtual CRT lines, e.g. 240
 } pc;
 
-layout(set = 0, binding = 0) uniform sampler2D uTex;
+layout(set = 0, binding = 0) uniform sampler2D uTexY;
+layout(set = 0, binding = 1) uniform sampler2D uTexU;
+layout(set = 0, binding = 2) uniform sampler2D uTexV;
+
+// Planar YUV -> RGB in the shader. Full-range coefficients, matching the
+// old CPU converter's look; only the matrix changes (601 for SD, 709 for HD).
+vec3 sampleVideo(vec2 uv) {
+    float y = texture(uTexY, uv).r;
+    float u = texture(uTexU, uv).r - 0.5;
+    float v = texture(uTexV, uv).r - 0.5;
+    if (pc.colorMatrix > 0.5) {
+        return vec3(y + 1.5748 * v,
+                    y - 0.1873 * u - 0.4681 * v,
+                    y + 1.8556 * u);
+    }
+    return vec3(y + 1.402 * v,
+                y - 0.34414 * u - 0.71414 * v,
+                y + 1.772 * u);
+}
+
+// Mask-cell coordinates, scaled up on high-resolution tubes so a 3-pixel
+// grille cell does not collapse into moire on a 1080p+/1440p phone screen.
+vec2 maskCoord() {
+    float s = clamp(pc.resolution.y / 720.0, 1.0, 3.0);
+    return gl_FragCoord.xy / s;
+}
 
 // User picture geometry: zoom about the center, then rotation.
 // Applied before aspect fitting so the aspect math sees the rotated frame.
 vec2 geometryUV(vec2 uv) {
+    if (pc.flip > 0.5) uv = vec2(1.0 - uv.x, uv.y);
     uv = (uv - vec2(0.5)) / pc.zoom + vec2(0.5);
     vec2 c = uv - vec2(0.5);
     if (pc.rotation > 0.5 && pc.rotation < 1.5) {
@@ -80,7 +109,11 @@ vec3 adjust(vec3 c) {
 }
 
 float scanlineFactor(vec2 screenUV) {
-    float s = 0.5 + 0.5 * cos(6.2831853 * gl_FragCoord.y * 0.5);
+    // Period in screen pixels = tube height / virtual CRT lines.
+    // At 240 lines on a ~1000px tube the period is ~4px (thick, CRT-like);
+    // the old fixed 2px period is what read as moire on hi-DPI screens.
+    float period = max(pc.resolution.y / max(pc.scanlineTvl, 60.0), 1.0);
+    float s = 0.5 + 0.5 * cos(6.2831853 * gl_FragCoord.y / period);
     return 1.0 - pc.scanline * 0.45 * s;
 }
 

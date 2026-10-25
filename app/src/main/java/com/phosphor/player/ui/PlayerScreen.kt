@@ -26,8 +26,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.Slider
-import androidx.compose.material3.SliderDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -40,6 +38,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
@@ -94,6 +96,20 @@ fun PlayerScreen(
             osdVisible = false
         } else {
             osdVisible = true
+        }
+    }
+
+    // Auto-rotation: a video's own rotation metadata wins over the
+    // default, without fighting the user -- this effect only re-runs when
+    // the title or the video's rotation changes, so a manual ROTATE tap
+    // afterwards is never overwritten.
+    LaunchedEffect(uiState.title, uiState.videoRotationDegrees) {
+        val deg = ((uiState.videoRotationDegrees % 360) + 360) % 360
+        if (deg != 0) {
+            val rot = (deg / 90).toFloat()
+            if (settings.rotation != rot) {
+                onSettingsChange(settings.copy(rotation = rot))
+            }
         }
     }
 
@@ -256,6 +272,7 @@ fun PlayerScreen(
         ) {
             Box(
                 modifier = Modifier
+                    .shadow(6.dp, CircleShape)
                     .size(10.dp)
                     .background(
                         if (uiState.isPlaying) Crt.LedOn else Color(0xFF1E3A26),
@@ -277,6 +294,79 @@ fun PlayerScreen(
         }
     }
 
+    // ---- cabinet dressing: VFD readout, speaker grilles, RCA jacks ----
+    val vfdRow: @Composable () -> Unit = {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(Color(0xFF062A1E), RoundedCornerShape(6.dp))
+                .border(1.dp, Color(0xFF0E4A34), RoundedCornerShape(6.dp))
+                .padding(horizontal = 10.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            OsdText(
+                "${fmtTime(uiState.positionMs)} / ${fmtTime(uiState.durationMs)}",
+                size = 12,
+                color = Color(0xFF7DFFB8),
+            )
+            Spacer(Modifier.weight(1f))
+            OsdText(
+                CrtPreset.entries[settings.presetIndex].title.uppercase(),
+                size = 10,
+                color = Color(0xFF7DFFB8),
+            )
+        }
+    }
+    val speakerGrille: @Composable () -> Unit = {
+        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            repeat(9) {
+                Box(
+                    modifier = Modifier
+                        .size(width = 3.dp, height = 26.dp)
+                        .background(Crt.SilverDark, RoundedCornerShape(2.dp)),
+                )
+            }
+        }
+    }
+    val cabinetBottom: @Composable () -> Unit = {
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                speakerGrille()
+                Spacer(Modifier.width(8.dp))
+                Box(Modifier.weight(1f)) { vfdRow() }
+                Spacer(Modifier.width(8.dp))
+                speakerGrille()
+            }
+            // Decorative front RCA jacks, like a real 2000s set.
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.Center,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                listOf(
+                    Color(0xFFFFD23D) to "VIDEO",
+                    Color.White to "L",
+                    Color(0xFFFF4A3D) to "R",
+                ).forEach { (c, label) ->
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(
+                            modifier = Modifier
+                                .size(14.dp)
+                                .background(c, CircleShape)
+                                .border(1.dp, Color.Black, CircleShape),
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        OsdText(label, size = 9, color = Crt.TextDim)
+                        Spacer(Modifier.width(12.dp))
+                    }
+                }
+            }
+        }
+    }
+
     // ---- transport cluster (the remote) ----
     val transportCluster: @Composable (Modifier) -> Unit = { transMod ->
         Column(
@@ -286,24 +376,38 @@ fun PlayerScreen(
                 .padding(14.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            // seek
-            val pos = uiState.positionMs.toFloat()
-            val dur = uiState.durationMs.toFloat().coerceAtLeast(1f)
+            // seek: custom phosphor bar -- tap to seek, no Material slider.
+            val dur = uiState.durationMs
+            var seekWidthPx by remember { mutableStateOf(0) }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 OsdText(fmtTime(uiState.positionMs), size = 12)
-                Slider(
-                    value = pos.coerceIn(0f, dur),
-                    onValueChange = { engine.seekTo(it.toLong()) },
-                    valueRange = 0f..dur,
+                Box(
                     modifier = Modifier
                         .weight(1f)
-                        .padding(horizontal = 8.dp),
-                    colors = SliderDefaults.colors(
-                        thumbColor = Crt.OsdGreen,
-                        activeTrackColor = Crt.OsdGreen,
-                        inactiveTrackColor = Crt.OsdDim,
-                    ),
-                )
+                        .padding(horizontal = 8.dp)
+                        .height(24.dp)
+                        .background(Crt.OsdDim, RoundedCornerShape(4.dp))
+                        .onSizeChanged { seekWidthPx = it.width }
+                        .pointerInput(dur) {
+                            detectTapGestures { offset ->
+                                if (seekWidthPx > 0 && dur > 0) {
+                                    val target = (offset.x / seekWidthPx * dur).toLong()
+                                        .coerceIn(0L, dur)
+                                    engine.seekTo(target)
+                                }
+                            }
+                        },
+                ) {
+                    val frac = if (dur > 0) {
+                        (uiState.positionMs.toFloat() / dur.toFloat()).coerceIn(0f, 1f)
+                    } else 0f
+                    Box(
+                        modifier = Modifier
+                            .fillMaxHeight()
+                            .fillMaxWidth(frac)
+                            .background(Crt.OsdGreen, RoundedCornerShape(4.dp)),
+                    )
+                }
                 OsdText(fmtTime(uiState.durationMs), size = 12)
             }
             // chunky keys
@@ -409,6 +513,7 @@ fun PlayerScreen(
                                 .aspectRatio(16f / 9f)
                         )
                         frontPanel()
+                        cabinetBottom()
                     }
                 }
                 transportCluster(
@@ -427,6 +532,7 @@ fun PlayerScreen(
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
+                        .weight(1f)
                         .background(Crt.Bezel, RoundedCornerShape(22.dp))
                         .border(1.dp, Crt.BezelEdge, RoundedCornerShape(22.dp))
                         .padding(14.dp),
@@ -438,10 +544,11 @@ fun PlayerScreen(
                                 .aspectRatio(16f / 9f)
                         )
                         frontPanel()
+                        cabinetBottom()
+                        Spacer(Modifier.weight(1f))
                     }
                 }
                 transportCluster(Modifier.fillMaxWidth())
-                Spacer(Modifier.weight(1f))
             }
         }
     }

@@ -4,7 +4,7 @@ layout(location = 0) in vec2 vUV;
 layout(location = 0) out vec4 outColor;
 
 vec3 apertureGrille() {
-    float x = mod(gl_FragCoord.x, 3.0);
+    float x = mod(maskCoord().x, 3.0);
     vec3 g = x < 1.0 ? vec3(1.0, 0.12, 0.12)
            : x < 2.0 ? vec3(0.12, 1.0, 0.12)
                      : vec3(0.12, 0.12, 1.0);
@@ -18,7 +18,7 @@ void main() {
         outColor = vec4(0.0, 0.0, 0.0, 1.0);
         return;
     }
-    vec3 col = texture(uTex, videoUV).rgb;
+    vec3 col = sampleVideo(videoUV).rgb;
     col = adjust(col);
     col *= scanlineFactor(screenUV);
     col *= mix(vec3(1.0), apertureGrille(), pc.mask);

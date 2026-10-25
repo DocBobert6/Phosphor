@@ -30,6 +30,7 @@
 #include <vector>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -229,8 +230,11 @@ struct PushConstants {
     float rotation;      // 0/1/2/3 = 0/90/180/270 degrees clockwise
     float zoom;          // 1 = normal, >1 zooms in, <1 zooms out
     float colorTemp;     // 0 = Cool (~9300K, factory), 1 = Medium, 2 = Warm (~6500K)
+    float flip;          // 0 = normal, 1 = mirror horizontally (selfie fix)
+    float colorMatrix;   // 0 = BT.601 (SD), 1 = BT.709 (HD) -- shader conversion
+    float scanlineTvl;   // virtual CRT lines for scanline period (e.g. 240)
 };
-static_assert(sizeof(PushConstants) == 64, "push constant layout mismatch");
+static_assert(sizeof(PushConstants) == 76, "push constant layout mismatch");
 
 // User-tunable picture parameters (defaults = a healthy 2000s tube).
 struct PictureParams {
@@ -246,6 +250,9 @@ struct PictureParams {
     float rotation = 0.0f;   // 0/1/2/3 = 0/90/180/270 deg clockwise
     float zoom = 1.0f;       // 1 = normal
     float colorTemp = 0.0f;  // 0 cool (factory), 1 medium, 2 warm
+    float flip = 0.0f;
+    float colorMatrix = 1.0f;  // HD default; VideoEngine sets 601 for SD
+    float scanlineTvl = 240.0f;
 };
 
 struct VideoFrame {
@@ -254,6 +261,15 @@ struct VideoFrame {
     VkImageView view = VK_NULL_HANDLE;
     AHardwareBuffer* buffer = nullptr;
     bool layoutTransitioned = false;
+};
+
+// One packed planar frame: Y (w*h) then U (cw*ch) then V (cw*ch).
+// state: 0 = free, 1 = writer is copying into it, 2 = pending upload,
+// 3 = render thread is copying it to the staging buffer.
+struct PlaneFrame {
+    uint8_t* data = nullptr;
+    uint32_t w = 0, h = 0, cw = 0, ch = 0;
+    int state = 0;
 };
 
 class Renderer {
@@ -301,7 +317,7 @@ private:
     // crashes in vkCreateSamplerYcbcrConversion.
     bool createPlainSampler();
     bool createStagingResources();
-    bool ensureVideoImage(uint32_t w, uint32_t h);
+    bool ensureVideoImages(uint32_t w, uint32_t h);
     void destroyVideoResources();
 
     // render loop
@@ -344,22 +360,29 @@ private:
     // vkQueueWaitIdle on one queue from two threads without external sync is
     // undefined behavior and hung the Mali GPU (freeze -> app kill -> reboot).
     VkSampler plainSampler_ = VK_NULL_HANDLE;
-    VkImage videoImage_ = VK_NULL_HANDLE;
-    VkDeviceMemory videoMemory_ = VK_NULL_HANDLE;
-    VkImageView videoView_ = VK_NULL_HANDLE;
+    // Planar YUV video images: [0]=Y (w x h), [1]=U, [2]=V (cw x ch, R8).
+    VkImage videoImages_[3] = {};
+    VkDeviceMemory videoMemories_[3] = {};
+    VkImageView videoViews_[3] = {};
     uint32_t videoW_ = 0;
     uint32_t videoH_ = 0;
+    uint32_t videoCw_ = 0;
+    uint32_t videoCh_ = 0;
     VkBuffer stagingBuffer_ = VK_NULL_HANDLE;
     VkDeviceMemory stagingMemory_ = VK_NULL_HANDLE;
     void* stagingMapped_ = nullptr;
     bool videoInShaderRead_ = false;
-    // CPU shadow frame (written by frame thread, uploaded by render thread)
-    uint8_t* cpuFrame_ = nullptr;
-    uint32_t frameW_ = 0;
-    uint32_t frameH_ = 0;
-    bool framePending_ = false;
+    // Ping-pong planar frames. The writer claims a FREE slot, copies the
+    // Y/U/V planes into it (plain byte copies, no colour maths), marks it
+    // PENDING; the render thread claims a PENDING slot, copies it to the
+    // staging buffer, then frees it. A frame is dropped, never torn, when
+    // both slots are busy -- the old single-buffer race (writer converting
+    // into cpuFrame_ while the render thread memcpy'd it) is gone.
+    PlaneFrame planeSlots_[2];
     uint32_t uploadW_ = 0;
     uint32_t uploadH_ = 0;
+    uint32_t uploadCw_ = 0;
+    uint32_t uploadCh_ = 0;
 
     VkCommandPool commandPool_ = VK_NULL_HANDLE;
     std::vector<VkCommandBuffer> commandBuffers_;
@@ -374,6 +397,15 @@ private:
     VideoFrame frame_;
     bool frameReady_ = false;
     float videoAspect_ = 16.0f / 9.0f;
+    // Wake-on-frame: the render loop sleeps on frameCv_ until a frame is
+    // pending, a setting changes, or a resize is requested, instead of
+    // redrawing the same frame at display refresh rate while paused.
+    // (Composite is the only preset that animates with time, so it wakes
+    // on a 33 ms timeout as well; the others sleep indefinitely.)
+    std::atomic<bool> framePending_{false};
+    std::atomic<bool> paramsDirty_{false};
+    std::condition_variable frameCv_;
+    std::mutex frameCvMutex_;
 
     // picture state
     std::mutex paramsMutex_;
@@ -705,16 +737,18 @@ bool Renderer::createRenderPass() {
 }
 
 bool Renderer::createDescriptorSetLayout() {
-    VkDescriptorSetLayoutBinding binding{};
-    binding.binding = 0;
-    binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    binding.descriptorCount = 1;
-    binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkDescriptorSetLayoutBinding bindings[3]{};
+    for (int i = 0; i < 3; i++) {
+        bindings[i].binding = (uint32_t)i;
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
 
     VkDescriptorSetLayoutCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    ci.bindingCount = 1;
-    ci.pBindings = &binding;
+    ci.bindingCount = 3;
+    ci.pBindings = bindings;
 
     if (vkCreateDescriptorSetLayout(device_, &ci, nullptr, &setLayout_) != VK_SUCCESS) {
         LOGE("vkCreateDescriptorSetLayout failed");
@@ -855,7 +889,7 @@ bool Renderer::createPipelines() {
 bool Renderer::createDescriptorPoolAndSet() {
     VkDescriptorPoolSize poolSize{};
     poolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSize.descriptorCount = 1;
+    poolSize.descriptorCount = 3;
 
     VkDescriptorPoolCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -1038,23 +1072,28 @@ static inline uint8_t clamp8(int v) {
 }
 
 // YUV420 (with arbitrary row/pixel strides) -> RGBA, BT.601.
-void yuv420ToRgba(const uint8_t* y, int yRowStride, int yPixStride,
-                  const uint8_t* u, int uRowStride, int uPixStride,
-                  const uint8_t* v, int vRowStride, int vPixStride,
-                  uint8_t* rgba, uint32_t width, uint32_t height) {
+// Copy one YUV_420_888 plane into a tightly packed destination buffer.
+// No colour maths here: conversion to RGB happens in the fragment shader
+// (see sampleVideo in shaders/common.glsl). Fast path is a plain memcpy
+// per row; the strided path only copies one byte per sample.
+void copyPlane(const uint8_t* src, int rowStride, int pixStride,
+               uint8_t* dst, uint32_t width, uint32_t height) {
+    if (width == 0 || height == 0 || src == nullptr || dst == nullptr) return;
+    if (pixStride == 1) {
+        if ((uint32_t)rowStride == width) {
+            memcpy(dst, src, (size_t)width * height);
+            return;
+        }
+        for (uint32_t j = 0; j < height; ++j) {
+            memcpy(dst + j * width, src + j * (uint32_t)rowStride, width);
+        }
+        return;
+    }
     for (uint32_t j = 0; j < height; ++j) {
-        const uint8_t* yRow = y + j * (uint32_t)yRowStride;
-        const uint8_t* uRow = u + (j / 2) * (uint32_t)uRowStride;
-        const uint8_t* vRow = v + (j / 2) * (uint32_t)vRowStride;
-        uint8_t* out = rgba + j * width * 4u;
+        const uint8_t* srow = src + j * (uint32_t)rowStride;
+        uint8_t* drow = dst + j * width;
         for (uint32_t i = 0; i < width; ++i) {
-            int Y = yRow[i * (uint32_t)yPixStride];
-            int U = (int)uRow[(i / 2) * (uint32_t)uPixStride] - 128;
-            int V = (int)vRow[(i / 2) * (uint32_t)vPixStride] - 128;
-            out[i * 4 + 0] = clamp8(Y + ((359 * V) >> 8));
-            out[i * 4 + 1] = clamp8(Y - ((88 * U + 183 * V) >> 8));
-            out[i * 4 + 2] = clamp8(Y + ((454 * U) >> 8));
-            out[i * 4 + 3] = 255;
+            drow[i] = srow[i * (uint32_t)pixStride];
         }
     }
 }
@@ -1075,9 +1114,12 @@ bool Renderer::createPlainSampler() {
 }
 
 bool Renderer::createStagingResources() {
+    // Packed planar staging: Y (3840x2160) + U + V (1920x1080 each).
+    const VkDeviceSize stagingSize =
+        (VkDeviceSize)3840u * 2160u + 2u * (VkDeviceSize)1920u * 1080u;
     VkBufferCreateInfo bci{};
     bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bci.size = 3840u * 2160u * 4u;  // 4K RGBA staging
+    bci.size = stagingSize;
     bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     if (vkCreateBuffer(device_, &bci, nullptr, &stagingBuffer_) != VK_SUCCESS) {
@@ -1109,89 +1151,103 @@ bool Renderer::createStagingResources() {
         LOGE("staging map failed");
         return false;
     }
-    cpuFrame_ = (uint8_t*)malloc(3840u * 2160u * 4u);
-    if (!cpuFrame_) {
-        LOGE("cpu frame buffer malloc failed");
-        return false;
+    for (int i = 0; i < 2; i++) {
+        planeSlots_[i].data = (uint8_t*)malloc((size_t)stagingSize);
+        if (!planeSlots_[i].data) {
+            LOGE("planar frame buffer malloc failed");
+            return false;
+        }
+        planeSlots_[i].state = 0;
     }
     return true;
 }
 
-bool Renderer::ensureVideoImage(uint32_t w, uint32_t h) {
-    if (videoImage_ != VK_NULL_HANDLE && videoW_ == w && videoH_ == h) return true;
-    if (videoView_ != VK_NULL_HANDLE) {
-        vkDestroyImageView(device_, videoView_, nullptr);
-        videoView_ = VK_NULL_HANDLE;
-    }
-    if (videoImage_ != VK_NULL_HANDLE) {
-        vkDestroyImage(device_, videoImage_, nullptr);
-        videoImage_ = VK_NULL_HANDLE;
-    }
-    if (videoMemory_ != VK_NULL_HANDLE) {
-        vkFreeMemory(device_, videoMemory_, nullptr);
-        videoMemory_ = VK_NULL_HANDLE;
+bool Renderer::ensureVideoImages(uint32_t w, uint32_t h) {
+    uint32_t cw = (w + 1) / 2;
+    uint32_t ch = (h + 1) / 2;
+    if (videoImages_[0] != VK_NULL_HANDLE && videoW_ == w && videoH_ == h) return true;
+    for (int i = 0; i < 3; i++) {
+        if (videoViews_[i] != VK_NULL_HANDLE) {
+            vkDestroyImageView(device_, videoViews_[i], nullptr);
+            videoViews_[i] = VK_NULL_HANDLE;
+        }
+        if (videoImages_[i] != VK_NULL_HANDLE) {
+            vkDestroyImage(device_, videoImages_[i], nullptr);
+            videoImages_[i] = VK_NULL_HANDLE;
+        }
+        if (videoMemories_[i] != VK_NULL_HANDLE) {
+            vkFreeMemory(device_, videoMemories_[i], nullptr);
+            videoMemories_[i] = VK_NULL_HANDLE;
+        }
     }
     videoW_ = w;
     videoH_ = h;
+    videoCw_ = cw;
+    videoCh_ = ch;
     videoInShaderRead_ = false;
 
-    VkImageCreateInfo ici{};
-    ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    ici.imageType = VK_IMAGE_TYPE_2D;
-    ici.format = VK_FORMAT_R8G8B8A8_UNORM;
-    ici.extent = {w, h, 1};
-    ici.mipLevels = 1;
-    ici.arrayLayers = 1;
-    ici.samples = VK_SAMPLE_COUNT_1_BIT;
-    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (vkCreateImage(device_, &ici, nullptr, &videoImage_) != VK_SUCCESS) {
-        LOGE("video image creation failed");
-        return false;
+    uint32_t extents[3][2] = {{w, h}, {cw, ch}, {cw, ch}};
+    for (int i = 0; i < 3; i++) {
+        VkImageCreateInfo ici{};
+        ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        ici.imageType = VK_IMAGE_TYPE_2D;
+        ici.format = VK_FORMAT_R8_UNORM;
+        ici.extent = {extents[i][0], extents[i][1], 1};
+        ici.mipLevels = 1;
+        ici.arrayLayers = 1;
+        ici.samples = VK_SAMPLE_COUNT_1_BIT;
+        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (vkCreateImage(device_, &ici, nullptr, &videoImages_[i]) != VK_SUCCESS) {
+            LOGE("planar video image %d creation failed", i);
+            return false;
+        }
+        VkMemoryRequirements req;
+        vkGetImageMemoryRequirements(device_, videoImages_[i], &req);
+        uint32_t memType = findMemoryType(physDevice_, req.memoryTypeBits,
+                                          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (memType == UINT32_MAX) {
+            LOGE("no device-local memory for planar video image %d", i);
+            return false;
+        }
+        VkMemoryAllocateInfo ai{};
+        ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        ai.allocationSize = req.size;
+        ai.memoryTypeIndex = memType;
+        if (vkAllocateMemory(device_, &ai, nullptr, &videoMemories_[i]) != VK_SUCCESS ||
+            vkBindImageMemory(device_, videoImages_[i], videoMemories_[i], 0) != VK_SUCCESS) {
+            LOGE("planar video image %d memory failed", i);
+            return false;
+        }
+        VkImageViewCreateInfo vci{};
+        vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        vci.image = videoImages_[i];
+        vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vci.format = VK_FORMAT_R8_UNORM;
+        vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        vci.subresourceRange.levelCount = 1;
+        vci.subresourceRange.layerCount = 1;
+        if (vkCreateImageView(device_, &vci, nullptr, &videoViews_[i]) != VK_SUCCESS) {
+            LOGE("planar video image view %d failed", i);
+            return false;
+        }
     }
-    VkMemoryRequirements req;
-    vkGetImageMemoryRequirements(device_, videoImage_, &req);
-    uint32_t memType = findMemoryType(physDevice_, req.memoryTypeBits,
-                                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (memType == UINT32_MAX) {
-        LOGE("no device-local memory for video image");
-        return false;
+    VkDescriptorImageInfo imgInfos[3]{};
+    VkWriteDescriptorSet writes[3]{};
+    for (int i = 0; i < 3; i++) {
+        imgInfos[i].sampler = plainSampler_;
+        imgInfos[i].imageView = videoViews_[i];
+        imgInfos[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = descriptorSet_;
+        writes[i].dstBinding = (uint32_t)i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[i].pImageInfo = &imgInfos[i];
     }
-    VkMemoryAllocateInfo ai{};
-    ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    ai.allocationSize = req.size;
-    ai.memoryTypeIndex = memType;
-    if (vkAllocateMemory(device_, &ai, nullptr, &videoMemory_) != VK_SUCCESS ||
-        vkBindImageMemory(device_, videoImage_, videoMemory_, 0) != VK_SUCCESS) {
-        LOGE("video image memory failed");
-        return false;
-    }
-    VkImageViewCreateInfo vci{};
-    vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    vci.image = videoImage_;
-    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    vci.format = VK_FORMAT_R8G8B8A8_UNORM;
-    vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    vci.subresourceRange.levelCount = 1;
-    vci.subresourceRange.layerCount = 1;
-    if (vkCreateImageView(device_, &vci, nullptr, &videoView_) != VK_SUCCESS) {
-        LOGE("video image view failed");
-        return false;
-    }
-    VkDescriptorImageInfo imgInfo{};
-    imgInfo.sampler = plainSampler_;
-    imgInfo.imageView = videoView_;
-    imgInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    VkWriteDescriptorSet write{};
-    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    write.dstSet = descriptorSet_;
-    write.dstBinding = 0;
-    write.descriptorCount = 1;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    write.pImageInfo = &imgInfo;
-    vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+    vkUpdateDescriptorSets(device_, 3, writes, 0, nullptr);
     return true;
 }
 
@@ -1199,52 +1255,69 @@ void Renderer::onFrameYUV(const uint8_t* y, int yRowStride, int yPixStride,
                            const uint8_t* u, int uRowStride, int uPixStride,
                            const uint8_t* v, int vRowStride, int vPixStride,
                            uint32_t width, uint32_t height) {
-    // Frame thread: CPU-only work. All Vulkan upload happens on the render
-    // thread (see recordCommands) to keep queue usage single-threaded.
+    // Frame thread: plain plane copies only -- no per-pixel colour maths.
+    // The GPU does YUV->RGB in the fragment shader (sampleVideo).
     if (width == 0 || height == 0 || width > 3840 || height > 2160) return;
-    if (!cpuFrame_) return;
-    yuv420ToRgba(y, yRowStride, yPixStride, u, uRowStride, uPixStride,
-                 v, vRowStride, vPixStride, cpuFrame_, width, height);
+    uint32_t cw = (width + 1) / 2;
+    uint32_t ch = (height + 1) / 2;
+    int slot = -1;
+    {
+        std::lock_guard<std::mutex> lock(frameMutex_);
+        if (!running_) return;
+        for (int i = 0; i < 2; i++) {
+            if (planeSlots_[i].state == 0 && planeSlots_[i].data != nullptr) {
+                planeSlots_[i].state = 1;
+                slot = i;
+                break;
+            }
+        }
+    }
+    if (slot < 0) return;  // both slots busy: drop this frame, never tear one
+    uint8_t* dst = planeSlots_[slot].data;
+    copyPlane(y, yRowStride, yPixStride, dst, width, height);
+    copyPlane(u, uRowStride, uPixStride, dst + (size_t)width * height, cw, ch);
+    copyPlane(v, vRowStride, vPixStride,
+              dst + (size_t)width * height + (size_t)cw * ch, cw, ch);
+    {
+        std::lock_guard<std::mutex> lock(frameMutex_);
+        planeSlots_[slot].w = width;
+        planeSlots_[slot].h = height;
+        planeSlots_[slot].cw = cw;
+        planeSlots_[slot].ch = ch;
+        planeSlots_[slot].state = 2;
+    }
+    framePending_ = true;
+    frameCv_.notify_all();
     std::lock_guard<std::mutex> lock(frameMutex_);
     if (!running_) return;
-    frameW_ = width;
-    frameH_ = height;
-    framePending_ = true;
     videoAspect_ = (float)width / (float)height;
 }
 
 void Renderer::destroyVideoResources() {
-    if (cpuFrame_) {
-        free(cpuFrame_);
-        cpuFrame_ = nullptr;
+    for (int i = 0; i < 2; i++) {
+        if (planeSlots_[i].data) {
+            free(planeSlots_[i].data);
+            planeSlots_[i].data = nullptr;
+        }
+        planeSlots_[i].state = 0;
     }
     if (stagingMapped_) {
         vkUnmapMemory(device_, stagingMemory_);
         stagingMapped_ = nullptr;
     }
-    if (stagingBuffer_ != VK_NULL_HANDLE) {
-        vkDestroyBuffer(device_, stagingBuffer_, nullptr);
-        stagingBuffer_ = VK_NULL_HANDLE;
-    }
-    if (stagingMemory_ != VK_NULL_HANDLE) {
-        vkFreeMemory(device_, stagingMemory_, nullptr);
-        stagingMemory_ = VK_NULL_HANDLE;
-    }
-    if (videoView_ != VK_NULL_HANDLE) {
-        vkDestroyImageView(device_, videoView_, nullptr);
-        videoView_ = VK_NULL_HANDLE;
-    }
-    if (videoImage_ != VK_NULL_HANDLE) {
-        vkDestroyImage(device_, videoImage_, nullptr);
-        videoImage_ = VK_NULL_HANDLE;
-    }
-    if (videoMemory_ != VK_NULL_HANDLE) {
-        vkFreeMemory(device_, videoMemory_, nullptr);
-        videoMemory_ = VK_NULL_HANDLE;
-    }
-    if (plainSampler_ != VK_NULL_HANDLE) {
-        vkDestroySampler(device_, plainSampler_, nullptr);
-        plainSampler_ = VK_NULL_HANDLE;
+    for (int i = 0; i < 3; i++) {
+        if (videoViews_[i] != VK_NULL_HANDLE) {
+            vkDestroyImageView(device_, videoViews_[i], nullptr);
+            videoViews_[i] = VK_NULL_HANDLE;
+        }
+        if (videoImages_[i] != VK_NULL_HANDLE) {
+            vkDestroyImage(device_, videoImages_[i], nullptr);
+            videoImages_[i] = VK_NULL_HANDLE;
+        }
+        if (videoMemories_[i] != VK_NULL_HANDLE) {
+            vkFreeMemory(device_, videoMemories_[i], nullptr);
+            videoMemories_[i] = VK_NULL_HANDLE;
+        }
     }
 }
 
@@ -1411,6 +1484,8 @@ void Renderer::onFrame(AHardwareBuffer* buffer) {
 void Renderer::setPreset(int index) {
     std::lock_guard<std::mutex> lock(paramsMutex_);
     if (index >= 0 && index < kPresetCount) preset_ = index;
+    paramsDirty_ = true;
+    frameCv_.notify_all();
 }
 
 void Renderer::setParam(int id, float value) {
@@ -1428,14 +1503,20 @@ void Renderer::setParam(int id, float value) {
         case 9: params_.rotation = value; break;
         case 10: params_.zoom = value; break;
         case 11: params_.colorTemp = value; break;
+        case 12: params_.flip = value; break;
+        case 13: params_.colorMatrix = value; break;
+        case 14: params_.scanlineTvl = value; break;
         default: break;
     }
+    paramsDirty_ = true;
+    frameCv_.notify_all();
 }
 
 void Renderer::requestResize(int w, int h) {
     pendingW_ = w;
     pendingH_ = h;
     resizePending_ = true;
+    frameCv_.notify_all();
 }
 
 // ---------------------------------------------------------------------------
@@ -1447,59 +1528,101 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex) {
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     vkBeginCommandBuffer(cmd, &begin);
 
-    // Upload any pending CPU frame. This runs on the render thread — the only
-    // thread that touches the Vulkan queue — keeping queue usage
-    // single-threaded (see the note on the video resource members).
-    bool doUpload = false;
+    // Upload any pending planar frame. The render thread claims a PENDING
+    // slot, copies its packed Y/U/V planes to the staging buffer, then
+    // frees the slot -- the writer can never overwrite a frame mid-upload.
+    int uploadSlot = -1;
     {
         std::lock_guard<std::mutex> lock(frameMutex_);
-        if (framePending_ && stagingMapped_ && cpuFrame_) {
-            doUpload = true;
-            uploadW_ = frameW_;
-            uploadH_ = frameH_;
-            memcpy(stagingMapped_, cpuFrame_, (size_t)frameW_ * frameH_ * 4);
-            framePending_ = false;
+        for (int i = 0; i < 2; i++) {
+            if (planeSlots_[i].state == 2) {
+                planeSlots_[i].state = 3;
+                uploadSlot = i;
+                uploadW_ = planeSlots_[i].w;
+                uploadH_ = planeSlots_[i].h;
+                uploadCw_ = planeSlots_[i].cw;
+                uploadCh_ = planeSlots_[i].ch;
+                break;
+            }
         }
     }
-    if (doUpload && ensureVideoImage(uploadW_, uploadH_)) {
-        VkImageMemoryBarrier b1{};
-        b1.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        b1.oldLayout = videoInShaderRead_ ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-                                           : VK_IMAGE_LAYOUT_UNDEFINED;
-        b1.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        b1.srcAccessMask = 0;
-        b1.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        b1.image = videoImage_;
-        b1.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        b1.subresourceRange.levelCount = 1;
-        b1.subresourceRange.layerCount = 1;
+    bool doUpload = false;
+    if (uploadSlot >= 0 && stagingMapped_ != nullptr) {
+        uint8_t* staging = (uint8_t*)stagingMapped_;
+        const uint8_t* src = planeSlots_[uploadSlot].data;
+        size_t ySize = (size_t)uploadW_ * uploadH_;
+        size_t cSize = (size_t)uploadCw_ * uploadCh_;
+        memcpy(staging, src, ySize);
+        memcpy(staging + ySize, src + ySize, cSize);
+        memcpy(staging + ySize + cSize, src + ySize + cSize, cSize);
+        doUpload = true;
+    }
+    if (doUpload && ensureVideoImages(uploadW_, uploadH_)) {
+        VkImageMemoryBarrier b1[3]{};
+        for (int i = 0; i < 3; i++) {
+            b1[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            b1[i].oldLayout = videoInShaderRead_ ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                                                  : VK_IMAGE_LAYOUT_UNDEFINED;
+            b1[i].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            b1[i].srcAccessMask = 0;
+            b1[i].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            b1[i].image = videoImages_[i];
+            b1[i].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            b1[i].subresourceRange.levelCount = 1;
+            b1[i].subresourceRange.layerCount = 1;
+        }
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-                             0, nullptr, 0, nullptr, 1, &b1);
+                             0, nullptr, 0, nullptr, 3, b1);
 
-        VkBufferImageCopy region{};
-        region.imageExtent = {uploadW_, uploadH_, 1};
-        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        region.imageSubresource.layerCount = 1;
-        vkCmdCopyBufferToImage(cmd, stagingBuffer_, videoImage_,
-                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        VkBufferImageCopy regions[3]{};
+        size_t ySize = (size_t)uploadW_ * uploadH_;
+        size_t cSize = (size_t)uploadCw_ * uploadCh_;
+        regions[0].bufferOffset = 0;
+        regions[0].imageExtent = {uploadW_, uploadH_, 1};
+        regions[0].imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        regions[0].imageSubresource.layerCount = 1;
+        regions[1].bufferOffset = ySize;
+        regions[1].imageExtent = {uploadCw_, uploadCh_, 1};
+        regions[1].imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        regions[1].imageSubresource.layerCount = 1;
+        regions[2].bufferOffset = ySize + cSize;
+        regions[2].imageExtent = {uploadCw_, uploadCh_, 1};
+        regions[2].imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        regions[2].imageSubresource.layerCount = 1;
+        for (int i = 0; i < 3; i++) {
+            vkCmdCopyBufferToImage(cmd, stagingBuffer_, videoImages_[i],
+                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &regions[i]);
+        }
 
-        VkImageMemoryBarrier b2 = b1;
-        b2.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        b2.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        b2.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        b2.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        VkImageMemoryBarrier b2[3]{};
+        for (int i = 0; i < 3; i++) {
+            b2[i] = b1[i];
+            b2[i].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            b2[i].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            b2[i].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            b2[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        }
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
-                             0, nullptr, 0, nullptr, 1, &b2);
+                             0, nullptr, 0, nullptr, 3, b2);
         videoInShaderRead_ = true;
         frameReady_ = true;
+    }
+    if (uploadSlot >= 0) {
+        std::lock_guard<std::mutex> lock(frameMutex_);
+        planeSlots_[uploadSlot].state = 0;
+        bool anyPending = false;
+        for (int i = 0; i < 2; i++) {
+            if (planeSlots_[i].state == 2) anyPending = true;
+        }
+        framePending_ = anyPending;
     }
 
     bool haveFrame = false;
     {
         std::lock_guard<std::mutex> lock(frameMutex_);
-        haveFrame = frameReady_ && videoImage_ != VK_NULL_HANDLE;
+        haveFrame = frameReady_ && videoImages_[0] != VK_NULL_HANDLE;
     }
 
     VkClearValue clear{};
@@ -1550,6 +1673,9 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex) {
         pc.rotation = params.rotation;
         pc.zoom = params.zoom;
         pc.colorTemp = params.colorTemp;
+        pc.flip = params.flip;
+        pc.colorMatrix = params.colorMatrix;
+        pc.scanlineTvl = params.scanlineTvl;
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines_[preset]);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_,
@@ -1566,6 +1692,28 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex) {
 
 void Renderer::renderLoop() {
     while (running_) {
+        // Sleep until there is work: a new frame, a settings change, or a
+        // resize. Composite animates with time, so it also wakes every
+        // 33 ms; every other preset sleeps until something actually changes.
+        {
+            int presetCopy = 0;
+            {
+                std::lock_guard<std::mutex> lock(paramsMutex_);
+                presetCopy = preset_;
+            }
+            std::unique_lock<std::mutex> lk(frameCvMutex_);
+            auto pred = [&] {
+                return !running_.load() || framePending_.load() ||
+                       resizePending_.load() || paramsDirty_.load();
+            };
+            if (presetCopy == 3) {
+                frameCv_.wait_for(lk, std::chrono::milliseconds(33), pred);
+            } else {
+                frameCv_.wait(lk, pred);
+            }
+        }
+        if (!running_) break;
+        paramsDirty_ = false;
         if (resizePending_.exchange(false)) {
             vkDeviceWaitIdle(device_);
             destroySwapchainResources();
@@ -1632,6 +1780,7 @@ void Renderer::shutdown() {
 
 void Renderer::shutdownLocked() {
     running_ = false;
+    frameCv_.notify_all();
     if (renderThread_.joinable()) renderThread_.join();
     if (device_ == VK_NULL_HANDLE) return;
 

@@ -38,25 +38,31 @@ class VideoEngine(private val context: Context) {
         val isBuffering: Boolean = false,
         val videoDebug: String = "",
         val framesReceived: Long = 0L,
+        val videoRotationDegrees: Int = 0,
     )
 
     private val _uiState = MutableStateFlow(UiState())
     val uiState: StateFlow<UiState> = _uiState
 
     private var frameCount = 0L
+    private var lastColorMatrix = -1f
 
     private val frameThread = HandlerThread("PhosphorFrames").apply { start() }
     private val frameHandler = Handler(frameThread.looper)
 
-    // Decoded frames land here at up to 1080p; the CRT shader does the rest.
+    // Decoded frames land here at up to 4K; the CRT shader does the rest.
+    // (Pixel recordings are 4K-capable, and the old 1080p ImageReader was
+    // a suspect in the black-screen reports -- the native staging buffers
+    // were already sized for 3840x2160.)
     private val imageReader: ImageReader =
-        ImageReader.newInstance(1920, 1080, ImageFormat.YUV_420_888, 3).apply {
+        ImageReader.newInstance(3840, 2160, ImageFormat.YUV_420_888, 3).apply {
             setOnImageAvailableListener({ reader ->
                 val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
                 try {
-                    // CPU-upload path: hand the YUV planes to native code for
-                    // conversion + upload (decoder AHBs can't be imported on
-                    // this device's driver).
+                    // GPU planar path: hand the YUV planes to native code for
+                    // upload as three R8 textures (decoder AHBs can't be
+                    // imported on this device's driver). Conversion to RGB
+                    // happens in the fragment shader.
                     val planes = image.planes
                     if (planes.size >= 3) {
                         frameCount++
@@ -143,6 +149,20 @@ class VideoEngine(private val context: Context) {
     private fun refresh() {
         val p = player
         val vf = p.videoFormat
+        // Colour matrix follows the video, not a fixed BT.601: HD video
+        // (including Pixel recordings) is BT.709, SD is BT.601. This is a
+        // width heuristic, not a colour-space parse, so it cannot fail on
+        // an unusual colourInfo -- and it fixes the old always-601 look.
+        if (vf != null) {
+            val matrix = if (vf.width >= 1280 || vf.height >= 720) 1f else 0f
+            if (matrix != lastColorMatrix) {
+                lastColorMatrix = matrix
+                try {
+                    VulkanBridge.nativeSetParam(VulkanBridge.PARAM_COLOR_MATRIX, matrix)
+                } catch (_: Throwable) {
+                }
+            }
+        }
         _uiState.value = _uiState.value.copy(
             isPlaying = p.isPlaying,
             positionMs = p.currentPosition.coerceAtLeast(0),
@@ -152,6 +172,7 @@ class VideoEngine(private val context: Context) {
                 "${it.sampleMimeType?.substringAfter('/') ?: "?"} ${it.width}x${it.height}"
             } ?: "no video track",
             framesReceived = frameCount,
+            videoRotationDegrees = vf?.rotationDegrees ?: 0,
         )
     }
 

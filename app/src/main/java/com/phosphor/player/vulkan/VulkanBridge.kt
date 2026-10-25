@@ -21,6 +21,9 @@ object VulkanBridge {
     const val PARAM_ROTATION = 9
     const val PARAM_ZOOM = 10
     const val PARAM_COLOR_TEMP = 11
+    const val PARAM_FLIP = 12
+    const val PARAM_COLOR_MATRIX = 13
+    const val PARAM_SCANLINE_TVL = 14
 
     const val ASPECT_FIT = 0f
     const val ASPECT_FILL = 1f
@@ -34,10 +37,11 @@ object VulkanBridge {
     external fun nativeOnFrame(hardwareBuffer: HardwareBuffer)
 
     /**
-     * CPU-upload path: YUV_420_888 planes are converted to RGBA in native code
-     * and uploaded to a plain sampled image. Used because some drivers (Mali)
-     * report VK_FORMAT_UNDEFINED for decoder AHBs and crash in
-     * vkCreateSamplerYcbcrConversion.
+     * GPU planar path: YUV_420_888 planes are copied (no colour maths) to
+     * native code and uploaded as three R8 textures; YUV->RGB conversion
+     * happens in the fragment shader (sampleVideo). The AHB import path in
+     * C++ is not used by Kotlin -- some drivers report VK_FORMAT_UNDEFINED
+     * for decoder AHBs and crash in vkCreateSamplerYcbcrConversion.
      */
     external fun nativeOnFrameYUV(
         yBuf: java.nio.ByteBuffer, yRowStride: Int, yPixStride: Int,

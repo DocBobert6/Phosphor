@@ -37,4 +37,7 @@ data class PictureSettings(
     val rotation: Float = 0f,       // 0/1/2/3 = 0/90/180/270 deg clockwise
     val zoom: Float = 1f,           // 1 = normal, 0.5..3
     val colorTemp: Float = 0f,      // 0 cool (factory), 1 medium, 2 warm
+    val flip: Float = 0f,           // 0 normal, 1 mirror horizontally
+    val colorMatrix: Float = 1f,    // 0 BT.601 (SD), 1 BT.709 (HD)
+    val scanlineTvl: Float = 240f,  // virtual CRT lines for scanlines
 )

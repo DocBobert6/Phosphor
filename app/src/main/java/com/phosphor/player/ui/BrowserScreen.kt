@@ -17,7 +17,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -29,6 +29,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -113,6 +114,7 @@ fun BrowserScreen(
             Spacer(Modifier.padding(4.dp))
             OsdText("— INPUT SELECT —", size = 15)
         }
+        SectionLabel("TAPE SHELF • EACH TAPE IS A CHANNEL")
 
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             PanelButton(
@@ -153,7 +155,7 @@ fun BrowserScreen(
             }
         } else {
             LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                items(files, key = { it.uri.toString() }) { doc ->
+                itemsIndexed(files, key = { _, doc -> doc.uri.toString() }) { index, doc ->
                     val name = doc.name ?: "Unknown"
                     Row(
                         modifier = Modifier
@@ -165,7 +167,22 @@ fun BrowserScreen(
                             .padding(12.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        OsdText("▶", size = 14)
+                        // VHS spine: channel number on a tape label.
+                        Column(
+                            modifier = Modifier
+                                .background(Crt.SilverDark, RoundedCornerShape(4.dp))
+                                .padding(horizontal = 8.dp, vertical = 10.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                        ) {
+                            OsdText("CH", size = 9, color = Color.Black)
+                            OsdText(
+                                "%02d".format(index + 2),
+                                size = 13,
+                                color = Color.Black,
+                            )
+                        }
+                        Spacer(Modifier.padding(4.dp))
+                        OsdText("📼", size = 14)
                         Spacer(Modifier.padding(4.dp))
                         Column(Modifier.weight(1f)) {
                             Text(

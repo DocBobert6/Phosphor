@@ -63,6 +63,9 @@ class MainActivity : ComponentActivity() {
                             VulkanBridge.nativeSetParam(VulkanBridge.PARAM_ROTATION, s.rotation)
                             VulkanBridge.nativeSetParam(VulkanBridge.PARAM_ZOOM, s.zoom)
                             VulkanBridge.nativeSetParam(VulkanBridge.PARAM_COLOR_TEMP, s.colorTemp)
+                            VulkanBridge.nativeSetParam(VulkanBridge.PARAM_FLIP, s.flip)
+                            VulkanBridge.nativeSetParam(VulkanBridge.PARAM_COLOR_MATRIX, s.colorMatrix)
+                            VulkanBridge.nativeSetParam(VulkanBridge.PARAM_SCANLINE_TVL, s.scanlineTvl)
                         } catch (_: Throwable) {
                             // native lib not loaded yet — settings re-apply on surface init
                         }

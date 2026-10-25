@@ -16,11 +16,11 @@ void main() {
     }
     float px = 1.0 / pc.resolution.x;
     // luma stays fairly sharp, chroma smears horizontally (composite bleed)
-    vec3 sharp = texture(uTex, videoUV).rgb;
-    vec3 blur = (texture(uTex, videoUV + vec2(px * 2.0, 0.0)).rgb
-               + texture(uTex, videoUV - vec2(px * 2.0, 0.0)).rgb
-               + texture(uTex, videoUV + vec2(px * 4.0, 0.0)).rgb
-               + texture(uTex, videoUV - vec2(px * 4.0, 0.0)).rgb) * 0.25;
+    vec3 sharp = sampleVideo(videoUV).rgb;
+    vec3 blur = (sampleVideo(videoUV + vec2(px * 2.0, 0.0)).rgb
+               + sampleVideo(videoUV - vec2(px * 2.0, 0.0)).rgb
+               + sampleVideo(videoUV + vec2(px * 4.0, 0.0)).rgb
+               + sampleVideo(videoUV - vec2(px * 4.0, 0.0)).rgb) * 0.25;
     float lumaSharp = dot(sharp, vec3(0.299, 0.587, 0.114));
     float lumaBlur  = dot(blur,  vec3(0.299, 0.587, 0.114));
     vec3 col = blur + (lumaSharp - lumaBlur);   // sharp luma + smeared chroma
